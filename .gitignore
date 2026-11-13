@@ -1,0 +1,20 @@
+# Terraform: local state and per-person settings stay out of git
+**/.terraform/
+**/.build/
+**/*.tfstate
+**/*.tfstate.*
+**/*.tfvars
+**/.terraform.tfstate.lock.info
+**/tfplan
+
+# node
+node_modules/
+**/dist/
+
+# 1-storage-comparison: video source + packaged output (hundreds of MB, `make content`)
+1-storage-comparison/content/src/
+1-storage-comparison/content/out/
+# recorded results of a frozen deployment (`make freeze`), contains resource IDs
+1-storage-comparison/web/public/data/snapshot.json
+
+.DS_Store

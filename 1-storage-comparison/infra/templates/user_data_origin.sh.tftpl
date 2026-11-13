@@ -1,0 +1,212 @@
+#!/bin/bash
+# First-boot bootstrap for the origin instance (Amazon Linux 2023).
+# Everything that must survive a reboot lives in systemd units written below.
+set -uxo pipefail
+exec > >(tee -a /var/log/demo-bootstrap.log | logger -t demo-bootstrap) 2>&1
+
+cat > /etc/demo.env <<EOF
+REGION=${region}
+BUCKET=${bucket}
+EBS_VOLUME_ID=${ebs_volume_id}
+EBS_IOPS=${ebs_iops}
+EBS_THROUGHPUT=${ebs_throughput}
+EFS_ID=${efs_id}
+EFS_THROUGHPUT_MODE=${efs_throughput_mode}
+LOADGEN_INSTANCE_ID=${loadgen_instance_id}
+PORT=8080
+EOF
+source /etc/demo.env
+
+# ---------------------------------------------------------------------------
+# Packages
+# ---------------------------------------------------------------------------
+dnf install -y nginx amazon-efs-utils xfsprogs nvme-cli
+dnf install -y nodejs22 || dnf install -y nodejs20
+NODE_BIN=$(command -v node || ls /usr/bin/node-* | head -1)
+echo "node: $NODE_BIN ($($NODE_BIN --version))"
+
+mkdir -p /opt/demo /mnt/ebs /mnt/efs /mnt/nvme /var/lib/demo/results
+
+# ---------------------------------------------------------------------------
+# Mount script: runs on every boot, before the API and the content sync.
+# ---------------------------------------------------------------------------
+cat > /opt/demo/mounts.sh <<'EOF'
+#!/bin/bash
+set -uo pipefail
+source /etc/demo.env
+mkdir -p /mnt/ebs /mnt/efs /mnt/nvme
+
+# --- EBS gp3 data volume (identified by its volume id in the NVMe serial) ---
+SERIAL=$(echo "$EBS_VOLUME_ID" | tr -d '-')
+DEV="/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_$SERIAL"
+for i in $(seq 1 60); do
+  [ -e "$DEV" ] && break
+  echo "waiting for EBS volume $EBS_VOLUME_ID ..."; sleep 5
+done
+if [ -e "$DEV" ]; then
+  blkid "$DEV" >/dev/null 2>&1 || mkfs.xfs -f "$DEV"
+  mountpoint -q /mnt/ebs || mount -o noatime "$DEV" /mnt/ebs
+else
+  echo "EBS volume never appeared"
+fi
+
+# --- Instance store NVMe (only on *d* instance types; ephemeral, re-made each boot) ---
+for n in /sys/block/nvme*; do
+  model=$(tr -d ' ' < "$n/device/model" 2>/dev/null || true)
+  if [ "$model" = "AmazonEC2NVMeInstanceStorage" ]; then
+    d="/dev/$(basename "$n")"
+    blkid "$d" >/dev/null 2>&1 || mkfs.xfs -f "$d"
+    mountpoint -q /mnt/nvme || mount -o noatime "$d" /mnt/nvme
+    break
+  fi
+done
+
+# --- EFS (plain NFS 4.1 via efs-utils; no TLS so the comparison is NFS vs block, not stunnel) ---
+for i in $(seq 1 60); do
+  mountpoint -q /mnt/efs && break
+  mount -t efs -o noresvport "$EFS_ID":/ /mnt/efs && break
+  mount -t nfs4 -o nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2,noresvport \
+    "$EFS_ID.efs.$REGION.amazonaws.com":/ /mnt/efs && break
+  echo "waiting for EFS $EFS_ID ..."; sleep 5
+done
+
+for m in ebs efs nvme; do
+  mountpoint -q /mnt/$m && { chmod 755 /mnt/$m; echo "mounted /mnt/$m"; } || echo "NOT mounted /mnt/$m"
+done
+exit 0
+EOF
+chmod +x /opt/demo/mounts.sh
+
+# ---------------------------------------------------------------------------
+# Pull/refresh the API from the bucket (also used by `make update-api`).
+# ---------------------------------------------------------------------------
+cat > /opt/demo/update.sh <<'EOF'
+#!/bin/bash
+set -euo pipefail
+source /etc/demo.env
+mkdir -p /opt/demo/api
+aws s3 cp --recursive "s3://$BUCKET/app/api" /opt/demo/api --region "$REGION" --only-show-errors
+chmod +x /opt/demo/api/*.sh
+cd /opt/demo/api
+npm install --omit=dev --no-audit --no-fund
+systemctl restart demo-api
+EOF
+chmod +x /opt/demo/update.sh
+
+# ---------------------------------------------------------------------------
+# nginx: static file serving for the EC2-backed paths + reverse proxy to the API
+# ---------------------------------------------------------------------------
+cat > /etc/nginx/nginx.conf <<'EOF'
+user nginx;
+worker_processes auto;
+error_log /var/log/nginx/error.log notice;
+pid /run/nginx.pid;
+
+events { worker_connections 8192; }
+
+http {
+    types {
+        text/html                       html;
+        text/plain                      txt;
+        application/json                json;
+        application/vnd.apple.mpegurl   m3u8;
+        video/mp2t                      ts;
+        video/mp4                       mp4;
+    }
+    default_type application/octet-stream;
+
+    log_format demo '$remote_addr "$request" $status $body_bytes_sent rt=$request_time xff="$http_x_forwarded_for"';
+    access_log /var/log/nginx/access.log demo;
+
+    sendfile on;
+    tcp_nopush on;
+    tcp_nodelay on;
+    aio threads;
+    keepalive_timeout 65;
+    server_tokens off;
+
+    server {
+        listen 80 default_server;
+        server_name _;
+
+        location = /healthz { add_header Content-Type text/plain; return 200 "ok\n"; }
+
+        # Same files, three different storage backends. Browse them: /ebs/video/
+        location /ebs/  { alias /mnt/ebs/;  autoindex on; add_header X-Storage-Backend ebs  always; add_header Cache-Control no-store always; }
+        location /efs/  { alias /mnt/efs/;  autoindex on; add_header X-Storage-Backend efs  always; add_header Cache-Control no-store always; }
+        location /nvme/ { alias /mnt/nvme/; autoindex on; add_header X-Storage-Backend nvme always; add_header Cache-Control no-store always; }
+
+        location /api/ {
+            proxy_pass http://127.0.0.1:8080;
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_read_timeout 120s;
+            proxy_buffering off;
+        }
+    }
+}
+EOF
+
+# ---------------------------------------------------------------------------
+# systemd units
+# ---------------------------------------------------------------------------
+cat > /etc/systemd/system/demo-mounts.service <<'EOF'
+[Unit]
+Description=Mount EBS / EFS / instance-store for the storage demo
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/demo/mounts.sh
+TimeoutStartSec=600
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+cat > /etc/systemd/system/demo-api.service <<EOF
+[Unit]
+Description=Storage demo benchmark API
+After=network-online.target demo-mounts.service
+Wants=network-online.target
+Requires=demo-mounts.service
+
+[Service]
+EnvironmentFile=/etc/demo.env
+WorkingDirectory=/opt/demo/api
+ExecStart=$NODE_BIN server.mjs
+Restart=always
+RestartSec=2
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Copies the video from S3 onto every mounted backend at boot (no-op until content is uploaded).
+cat > /etc/systemd/system/demo-sync.service <<'EOF'
+[Unit]
+Description=Sync demo video from S3 to EBS / EFS / NVMe
+After=demo-mounts.service network-online.target
+Requires=demo-mounts.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/demo/api/sync.sh
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable demo-mounts demo-api demo-sync nginx
+
+/opt/demo/mounts.sh
+/opt/demo/update.sh || echo "API install failed; check /var/log/demo-bootstrap.log"
+systemctl restart nginx
+systemctl start demo-sync --no-block
+
+echo "bootstrap finished"

@@ -1,0 +1,31 @@
+#!/bin/bash
+# Load generator bootstrap: k6 + the viewer script. Driven over SSM by the API.
+set -uxo pipefail
+exec > >(tee -a /var/log/demo-bootstrap.log | logger -t demo-bootstrap) 2>&1
+
+cat > /etc/demo.env <<EOF
+REGION=${region}
+BUCKET=${bucket}
+EOF
+
+# k6: official rpm repo first, GitHub release tarball as fallback.
+dnf install -y https://dl.k6.io/rpm/repo.rpm && dnf install -y k6 || true
+if ! command -v k6 >/dev/null; then
+  VER=$(curl -fsSL https://api.github.com/repos/grafana/k6/releases/latest | grep -oE '"tag_name": *"[^"]+"' | cut -d'"' -f4)
+  curl -fsSL -o /tmp/k6.tgz "https://github.com/grafana/k6/releases/download/$VER/k6-$VER-linux-amd64.tar.gz"
+  tar -xzf /tmp/k6.tgz -C /tmp
+  install -m755 "/tmp/k6-$VER-linux-amd64/k6" /usr/local/bin/k6
+fi
+k6 version
+
+# Let k6 open many sockets.
+cat > /etc/security/limits.d/k6.conf <<'EOF'
+* soft nofile 250000
+* hard nofile 250000
+EOF
+sysctl -w net.ipv4.ip_local_port_range="1024 65535"
+
+mkdir -p /opt/loadgen
+aws s3 cp "s3://${bucket}/app/loadtest/viewers.js" /opt/loadgen/viewers.js --region ${region} || true
+
+echo "loadgen bootstrap finished"
